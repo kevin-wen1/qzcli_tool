@@ -699,6 +699,11 @@ class QzAPI:
         
         return list(workspaces.values())
 
+    @staticmethod
+    def _has_session_cookie(cookies: Dict[str, str]) -> bool:
+        """Check if any session-like cookie exists (handles name changes like session -> inspire-session)."""
+        return any("session" in name.lower() for name in cookies)
+
     def login_with_cas(self, username: str, password: str) -> str:
         """
         通过 CAS 统一认证登录，获取 session cookie
@@ -741,12 +746,11 @@ class QzAPI:
         
         # 如果已经在启智平台且有 session cookie，说明已登录
         if current_host == "qz.sii.edu.cn":
-            # 只收集 qz.sii.edu.cn 域的 cookies
             qz_cookies = {}
             for cookie in session.cookies:
                 if "qz.sii.edu.cn" in cookie.domain:
                     qz_cookies[cookie.name] = cookie.value
-            if "session" in qz_cookies:
+            if self._has_session_cookie(qz_cookies):
                 cookie_str = "; ".join([f"{k}={v}" for k, v in qz_cookies.items()])
                 return cookie_str
         
@@ -843,8 +847,7 @@ class QzAPI:
             if "qz.sii.edu.cn" in cookie.domain:
                 all_cookies[cookie.name] = cookie.value
         
-        if not all_cookies or "session" not in all_cookies:
-            # 尝试再次访问启智平台主页以确保获取 session
+        if not all_cookies or not self._has_session_cookie(all_cookies):
             try:
                 resp = session.get(self.base_url, timeout=30, allow_redirects=True)
                 for cookie in session.cookies:
@@ -853,7 +856,7 @@ class QzAPI:
             except:
                 pass
         
-        if not all_cookies or "session" not in all_cookies:
+        if not all_cookies or not self._has_session_cookie(all_cookies):
             raise QzAPIError("登录成功但未获取到 session cookie")
         
         # 构建 cookie 字符串（确保 session 和 session_2 都包含）
