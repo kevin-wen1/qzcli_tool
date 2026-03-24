@@ -2274,6 +2274,136 @@ def cmd_logs(args):
     return 0
 
 
+def cmd_perf(args):
+    """查看自己运行中的 HPC 任务实例资源利用率"""
+    display = get_display()
+    api = get_api()
+
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data["cookie"]
+
+    workspace_input = getattr(args, "workspace", None)
+    if not workspace_input:
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间，请先运行: qzcli res -u")
+            return 1
+        workspace_ids = list(all_resources.keys())
+    elif workspace_input.startswith("ws-"):
+        workspace_ids = [workspace_input]
+    else:
+        wid = find_workspace_by_name(workspace_input)
+        if not wid:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            return 1
+        workspace_ids = [wid]
+
+    import requests as _requests
+
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "cookie": cookie,
+        "origin": "https://qz.sii.edu.cn",
+        "referer": "https://qz.sii.edu.cn/",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    }
+
+    for workspace_id in workspace_ids:
+        cached = get_workspace_resources(workspace_id)
+        ws_name = cached.get("name", workspace_id) if cached else workspace_id
+
+        # 获取我的 RUNNING 任务
+        try:
+            r = _requests.post(
+                api.base_url + "/api/v1/hpc_jobs/list",
+                json={"workspace_id": workspace_id, "page_num": 1, "page_size": 100, "status": "RUNNING"},
+                headers=headers, timeout=15,
+            )
+            jobs = r.json().get("data", {}).get("jobs", [])
+        except Exception as e:
+            display.print_warning(f"获取任务列表失败: {e}")
+            continue
+
+        if not jobs:
+            display.print(f"[dim]{ws_name}: 没有运行中的任务[/dim]")
+            continue
+
+        # 收集所有节点名
+        my_nodes = set()
+        job_nodes = {}  # job_id -> nodes
+        for j in jobs:
+            nodes = j.get("nodes", [])
+            job_nodes[j.get("job_id", "")] = (j.get("job_name", ""), nodes)
+            my_nodes.update(nodes)
+
+        # 获取所有节点利用率（分页）
+        all_node_data = []
+        lcg_ids = set()
+        for j in jobs:
+            lcg = j.get("logic_compute_group_id", "")
+            if lcg:
+                lcg_ids.add(lcg)
+
+        for lcg_id in (lcg_ids or [""]):
+            page_num = 1
+            while True:
+                try:
+                    data = api.list_node_dimension(
+                        workspace_id, cookie,
+                        logic_compute_group_id=lcg_id or None,
+                        page_num=page_num, page_size=200,
+                    )
+                    batch = data.get("node_dimensions", [])
+                    total = data.get("total", 0)
+                    all_node_data.extend(batch)
+                    if len(all_node_data) >= total or len(batch) < 200:
+                        break
+                    page_num += 1
+                except Exception:
+                    break
+
+        node_stats = {n.get("name"): n for n in all_node_data if n.get("name") in my_nodes}
+
+        display.print(f"\n[bold]{ws_name} — 我的运行中任务资源利用率[/bold]")
+        display.print(f"  {'任务名称':<45} {'节点':<18} {'CPU%':>6} {'MEM%':>6} {'CPU核':>8} {'MEM(GiB)':>12}")
+        display.print("  " + "-" * 100)
+
+        for job_id, (job_name, nodes) in job_nodes.items():
+            label = (job_name or job_id)[:44]
+            if not nodes:
+                display.print(f"  {label:<45} {'(无节点)':<18}")
+                continue
+            for node in nodes:
+                ns = node_stats.get(node)
+                if ns:
+                    cpu = ns.get("cpu", {})
+                    mem = ns.get("memory", {})
+                    cpu_pct = cpu.get("usage_rate", 0) * 100
+                    mem_pct = mem.get("usage_rate", 0) * 100
+                    cpu_used = cpu.get("used", 0)
+                    cpu_total = cpu.get("total", 0)
+                    mem_used = mem.get("used", 0)
+                    mem_total = mem.get("total", 0)
+                    cpu_color = "red" if cpu_pct > 90 else "yellow" if cpu_pct > 50 else "green"
+                    mem_color = "red" if mem_pct > 90 else "yellow" if mem_pct > 50 else "green"
+                    display.print(
+                        f"  {label:<45} {node:<18} "
+                        f"[{cpu_color}]{cpu_pct:>5.1f}%[/{cpu_color}] "
+                        f"[{mem_color}]{mem_pct:>5.1f}%[/{mem_color}] "
+                        f"{cpu_used:>4}/{cpu_total:<4} "
+                        f"{mem_used:>6.1f}/{mem_total:<6.1f}"
+                    )
+                else:
+                    display.print(f"  {label:<45} {node:<18} {'N/A':>6} {'N/A':>6}")
+                label = ""  # 同任务多节点只显示一次名称
+
+    return 0
+
+
 def cmd_hpc_usage(args):
     """查看 HPC 任务 CPU/内存利用率（基于节点维度统计）"""
     display = get_display()
@@ -2720,6 +2850,9 @@ def main():
     hpc_parser.add_argument("--no-track", action="store_true", help="不追踪任务")
     hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="JSON 输出")
 
+    perf_parser = subparsers.add_parser("perf", help="查看我的 HPC 任务实例资源利用率")
+    perf_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（默认查询所有）")
+
     logs_parser = subparsers.add_parser("logs", help="查看 HPC 任务日志")
     logs_parser.add_argument("job_id", help="任务 ID（hpc-job-... 或短 UUID）")
     logs_parser.add_argument("--follow", "-f", action="store_true", help="持续追踪日志（类似 tail -f）")
@@ -2775,6 +2908,7 @@ def main():
         "create-job": cmd_create,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
+        "perf": cmd_perf,
         "logs": cmd_logs,
         "log": cmd_logs,
         "batch": cmd_batch,
