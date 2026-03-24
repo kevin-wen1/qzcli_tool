@@ -293,6 +293,62 @@ class QzAPI:
             )
         return result.get("data", {})
 
+    def get_hpc_job_log(
+        self,
+        job_id: str,
+        cookie: str,
+        log_type: str = "aggregate_log",
+        page_num: int = 1,
+        page_size: int = 200,
+    ) -> Dict[str, Any]:
+        """
+        获取 HPC 任务日志（GET /api/v1/hpc_jobs/aggregate_log 或 /api/v1/hpc_jobs/log）
+
+        Args:
+            job_id: 任务 ID（hpc-job-...）
+            cookie: 浏览器 cookie
+            log_type: 'aggregate_log' 或 'log'
+            page_num: 页码
+            page_size: 每页行数
+
+        Returns:
+            包含日志内容的字典
+        """
+        url = f"{self.base_url}/api/v1/hpc_jobs/{log_type}"
+        params = {"job_id": job_id, "page_num": page_num, "page_size": page_size}
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "referer": "https://qz.sii.edu.cn/",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON")
+        # code=100000 表示记录不存在（日志尚未写入）
+        return result
+
+    def get_hpc_job_detail(
+        self,
+        workspace_id: str,
+        job_id: str,
+        cookie: str,
+    ) -> Optional[Dict[str, Any]]:
+        """从 hpc_jobs/list 中获取单个任务详情"""
+        data = self.list_hpc_jobs(workspace_id, cookie, page_size=100)
+        for job in data.get("jobs", []):
+            if job.get("job_id") == job_id:
+                return job
+        return None
+
     def test_connection(self) -> bool:
         """测试连接"""
         try:

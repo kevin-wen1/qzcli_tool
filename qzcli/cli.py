@@ -2176,6 +2176,104 @@ def cmd_hpc(args):
     return 0
 
 
+def cmd_logs(args):
+    """查看 HPC 任务日志"""
+    display = get_display()
+    api = get_api()
+
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data["cookie"]
+
+    job_id = args.job_id
+    if not job_id.startswith("hpc-job-"):
+        job_id = "hpc-job-" + job_id
+
+    follow = args.follow
+    lines = getattr(args, "lines", 100)
+    log_type = getattr(args, "log_type", "aggregate_log")
+    max_retries = getattr(args, "retries", 10)
+
+    import time as _time
+
+    def fetch_log(page_size=500):
+        return api.get_hpc_job_log(job_id, cookie, log_type=log_type, page_size=page_size)
+
+    def extract_lines(result):
+        """返回 (lines_list, found)"""
+        code = result.get("code", -1)
+        if code == 100000:
+            return [], False
+        data = result.get("data") or {}
+        log_lines = (
+            data.get("log_lines")
+            or data.get("lines")
+            or data.get("content")
+            or []
+        )
+        if isinstance(log_lines, str):
+            log_lines = log_lines.splitlines()
+        return log_lines, True
+
+    if not follow:
+        retries = 0
+        while retries <= max_retries:
+            try:
+                result = fetch_log()
+                log_lines, found = extract_lines(result)
+                if found:
+                    tail = log_lines[-lines:] if lines else log_lines
+                    for ln in tail:
+                        display.print(ln.get("content", str(ln)) if isinstance(ln, dict) else str(ln))
+                    break
+                retries += 1
+                if retries <= max_retries:
+                    display.print(f"[dim]日志暂未就绪，3s 后重试 ({retries}/{max_retries})...[/dim]")
+                    _time.sleep(3)
+                else:
+                    display.print_warning(
+                        "日志暂时不可用（平台聚合日志尚未写入）\n"
+                        "提示：可加 --follow 持续等待，或稍后重试"
+                    )
+            except QzAPIError as e:
+                if "401" in str(e):
+                    display.print_error("Cookie 已过期，请重新登录: qzcli login")
+                    return 1
+                display.print_error(f"获取日志失败: {e}")
+                return 1
+    else:
+        display.print(f"[dim]追踪任务 {job_id} 日志（Ctrl+C 停止）...[/dim]")
+        shown = 0
+        wait_printed = False
+        try:
+            while True:
+                try:
+                    result = fetch_log()
+                    log_lines, found = extract_lines(result)
+                    if found:
+                        wait_printed = False
+                        new_lines = log_lines[shown:]
+                        for ln in new_lines:
+                            display.print(ln.get("content", str(ln)) if isinstance(ln, dict) else str(ln))
+                        shown = len(log_lines)
+                    else:
+                        if not wait_printed:
+                            display.print("[dim]等待日志写入...[/dim]")
+                            wait_printed = True
+                except QzAPIError as e:
+                    if "401" in str(e):
+                        display.print_error("Cookie 已过期，请重新登录: qzcli login")
+                        return 1
+                    display.print_warning(f"请求失败: {e}")
+                _time.sleep(5)
+        except KeyboardInterrupt:
+            display.print("\n[dim]已停止追踪[/dim]")
+
+    return 0
+
+
 def cmd_hpc_usage(args):
     """查看 HPC 任务 CPU/内存利用率（基于节点维度统计）"""
     display = get_display()
@@ -2622,6 +2720,13 @@ def main():
     hpc_parser.add_argument("--no-track", action="store_true", help="不追踪任务")
     hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="JSON 输出")
 
+    logs_parser = subparsers.add_parser("logs", help="查看 HPC 任务日志")
+    logs_parser.add_argument("job_id", help="任务 ID（hpc-job-... 或短 UUID）")
+    logs_parser.add_argument("--follow", "-f", action="store_true", help="持续追踪日志（类似 tail -f）")
+    logs_parser.add_argument("--lines", "-n", type=int, default=100, help="显示最后 N 行（默认 100）")
+    logs_parser.add_argument("--log-type", default="aggregate_log", choices=["aggregate_log", "log"], help="日志类型（默认 aggregate_log）")
+    logs_parser.add_argument("--retries", type=int, default=10, help="日志未就绪时的最大重试次数（默认 10）")
+
     hpc_usage_parser = subparsers.add_parser("hpc-usage", help="查看 HPC 节点 CPU/内存利用率")
     hpc_usage_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（默认查询所有已缓存工作空间）")
     hpc_usage_parser.add_argument("--compute-group", dest="compute_group", default="", help="计算组 ID（lcg-...），省略则查所有 HPC 节点")
@@ -2670,6 +2775,8 @@ def main():
         "create-job": cmd_create,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
+        "logs": cmd_logs,
+        "log": cmd_logs,
         "batch": cmd_batch,
     }
     
