@@ -384,20 +384,34 @@ def cmd_stop(args):
     display = get_display()
     store = get_store()
     api = get_api()
-    
+
     job_id = args.job_id
-    
+
     # 确认
     if not args.yes:
         confirm = input(f"确定要停止任务 {job_id}? [y/N] ").strip().lower()
         if confirm != "y":
             display.print("已取消")
             return 0
-    
+
     try:
-        if api.stop_job(job_id):
+        # HPC/CPU 任务使用 cookie 认证的不同 API
+        if job_id.startswith("hpc-job-"):
+            cookie_data = get_cookie()
+            if not cookie_data:
+                display.print_error("未找到 cookie，请先运行: qzcli login")
+                return 1
+            cookie = cookie_data.get("cookie", "")
+            if not cookie:
+                display.print_error("cookie 为空，请先运行: qzcli login")
+                return 1
+            success = api.stop_hpc_job(job_id, cookie)
+        else:
+            # 分布式训练任务使用 Bearer token
+            success = api.stop_job(job_id)
+
+        if success:
             display.print_success(f"任务 {job_id} 已停止")
-            # 更新本地状态
             store.update(job_id, status="job_stopped")
             return 0
         else:
@@ -2114,8 +2128,13 @@ def cmd_hpc(args):
             display.print_error("未指定项目且缓存中无可用项目，请用 --project 指定")
             return 1
 
+    # Default cpus_per_task to cpu if not specified (single-node allocation pattern)
+    if args.cpus_per_task is None:
+        args.cpus_per_task = args.cpu
+
     display.print(f"\n[bold]HPC 任务提交[/bold]")
     display.print(f"  名称: {args.name}")
+
     display.print(f"  计算组: {args.compute_group}")
     display.print(f"  规格: {args.predef_quota_id} (cpu={args.cpu}, mem={args.mem_gi}GiB)")
     display.print(f"  节点数: {args.instances}  cpus/task: {args.cpus_per_task}")
@@ -2842,7 +2861,7 @@ def main():
     hpc_parser.add_argument("--cpu", type=int, required=True, help="每节点 CPU 核心数")
     hpc_parser.add_argument("--mem-gi", dest="mem_gi", type=int, required=True, help="每节点内存 GiB")
     hpc_parser.add_argument("--instances", type=int, default=1, help="节点数（默认 1）")
-    hpc_parser.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=1, help="每任务 CPU 数（默认同 --cpu）")
+    hpc_parser.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=None, help="每任务 CPU 数（默认同 --cpu）")
     hpc_parser.add_argument("--memory-per-cpu", dest="memory_per_cpu", default="5G", help="每 CPU 内存（默认 5G）")
     hpc_parser.add_argument("--image", required=True, help="容器镜像地址")
     hpc_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")

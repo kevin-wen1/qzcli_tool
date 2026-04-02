@@ -133,9 +133,41 @@ class QzAPI:
         return results
     
     def stop_job(self, job_id: str) -> bool:
-        """停止任务"""
+        """停止分布式训练任务"""
         try:
             self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
+            return True
+        except QzAPIError:
+            return False
+
+    def stop_hpc_job(self, job_id: str, cookie: str) -> bool:
+        """停止 HPC/CPU 任务"""
+        try:
+            url = f"{self.base_url}/api/v1/hpc_jobs/stop"
+            headers = {
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json",
+                "cookie": cookie,
+                "origin": "https://qz.sii.edu.cn",
+                "referer": "https://qz.sii.edu.cn/jobs/hpc",
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            }
+            response = requests.post(
+                url,
+                json={"job_id": job_id},
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code == 401:
+                raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+            if response.status_code != 200:
+                raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+            result = response.json()
+            if result.get("code") != 0:
+                raise QzAPIError(
+                    f"API 请求失败: {result.get('message', '未知错误')}",
+                    result.get("code"),
+                )
             return True
         except QzAPIError:
             return False
