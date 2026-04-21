@@ -595,6 +595,177 @@ def cmd_clear(args):
     return 0
 
 
+def cmd_delete(args):
+    """删除平台上的任务（同时清理本地记录）"""
+    display = get_display()
+    store = get_store()
+    api = get_api()
+
+    # 获取 cookie
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data["cookie"]
+
+    # 确定要删除的任务列表
+    jobs_to_delete = []
+
+    if args.job_ids:
+        # 直接指定 job_id
+        for job_id in args.job_ids:
+            jobs_to_delete.append({"job_id": job_id, "name": "", "status": "", "type": "unknown"})
+    else:
+        # 按条件过滤 - 从 API 获取
+        display.print("[dim]正在获取任务列表...[/dim]")
+
+        # 确定工作空间
+        workspace_input = args.workspace
+        if not workspace_input:
+            workspace_input = cookie_data.get("workspace_id", "")
+
+        if not workspace_input:
+            display.print_error("请指定工作空间: -w <名称或ID>")
+            return 1
+
+        if workspace_input.startswith("ws-"):
+            workspace_id = workspace_input
+        else:
+            workspace_id = find_workspace_by_name(workspace_input)
+            if not workspace_id:
+                display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+                return 1
+
+        # 获取分布式训练任务
+        try:
+            result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
+            for job in result.get("jobs", []):
+                job_id = job.get("job_id", "")
+                name = job.get("name", "")
+                status = job.get("status", "").lower()
+                created_at = job.get("created_at", "")
+
+                jobs_to_delete.append({
+                    "job_id": job_id,
+                    "name": name,
+                    "status": status,
+                    "created_at": created_at,
+                    "type": "train",
+                })
+        except QzAPIError as e:
+            display.print_warning(f"获取分布式训练任务失败: {e}")
+
+        # 获取 HPC 任务
+        try:
+            hpc_result = api.list_hpc_jobs(workspace_id, cookie, page_size=200)
+            for job in hpc_result.get("jobs", []):
+                job_id = job.get("job_id", "")
+                name = job.get("job_name", "")
+                status = job.get("status", "").lower()
+                created_at = job.get("created_at", "")
+
+                jobs_to_delete.append({
+                    "job_id": job_id,
+                    "name": name,
+                    "status": status,
+                    "created_at": created_at,
+                    "type": "hpc",
+                })
+        except QzAPIError as e:
+            display.print_warning(f"获取 HPC 任务失败: {e}")
+
+    if not jobs_to_delete:
+        display.print("没有符合条件的任务")
+        return 0
+
+    # 应用过滤条件（交集）
+    import datetime
+
+    filtered = []
+    for job in jobs_to_delete:
+        # 状态过滤
+        if args.status and args.status.lower() not in job.get("status", "").lower():
+            continue
+
+        # 名称过滤
+        if args.name and args.name.lower() not in job.get("name", "").lower():
+            continue
+
+        # 时间过滤
+        if args.older_than:
+            created_at = job.get("created_at", "")
+            if created_at:
+                try:
+                    created_dt = datetime.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    age_days = (datetime.datetime.now(datetime.timezone.utc) - created_dt).days
+                    if age_days < args.older_than:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+
+        filtered.append(job)
+
+    # 限制数量
+    if args.limit:
+        filtered = filtered[:args.limit]
+
+    if not filtered:
+        display.print("没有符合条件的任务")
+        return 0
+
+    # 显示待删除列表
+    display.print(f"\n[bold]将删除以下 {len(filtered)} 个任务：[/bold]\n")
+
+    for i, job in enumerate(filtered, 1):
+        job_id = job["job_id"]
+        name = job.get("name", "")[:40]
+        status = job.get("status", "")
+        job_type = "HPC" if job_id.startswith("hpc-job-") else "Train"
+        display.print(f"  {i:3d}. [{job_type}] {name:<40} {status:<15} {job_id}")
+
+    display.print("")
+
+    # 确认
+    if not args.yes:
+        confirm = input(f"确定要删除以上 {len(filtered)} 个任务？[y/N] ").strip().lower()
+        if confirm != "y":
+            display.print("已取消")
+            return 0
+
+    # 执行删除
+    success_count = 0
+    fail_count = 0
+
+    for job in filtered:
+        job_id = job["job_id"]
+        name = job.get("name", "")
+        is_hpc = job_id.startswith("hpc-job-")
+
+        try:
+            if is_hpc:
+                # First try force delete (stop + delete) for creating/failed jobs
+                success = api.force_delete_hpc_job(job_id, cookie)
+                # If force delete worked, count it; otherwise try regular delete
+                if not success:
+                    success = api.delete_hpc_job(job_id, cookie)
+            else:
+                success = api.delete_train_job(job_id, cookie)
+
+            if success:
+                display.print_success(f"已删除: {name or job_id}")
+                store.remove(job_id)
+                success_count += 1
+            else:
+                display.print_error(f"删除失败: {name or job_id}")
+                fail_count += 1
+        except Exception as e:
+            display.print_error(f"删除失败 {name or job_id}: {e}")
+            fail_count += 1
+
+    display.print(f"\n[bold]删除完成：[/bold] 成功 {success_count}，失败 {fail_count}")
+    return 0 if fail_count == 0 else 1
+
+
 def cmd_cookie(args):
     """设置浏览器 cookie"""
     display = get_display()
@@ -2783,6 +2954,16 @@ def main():
     clear_parser = subparsers.add_parser("clear", help="清空所有任务记录")
     clear_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
     
+    # delete 命令 - 删除平台上的任务
+    delete_parser = subparsers.add_parser("delete", aliases=["del"], help="删除平台上的任务（同时清理本地记录）")
+    delete_parser.add_argument("job_ids", nargs="*", help="任务 ID（可多个）")
+    delete_parser.add_argument("--status", "-s", help="按状态过滤（如 running/failed/stopped）")
+    delete_parser.add_argument("--name", help="按名称匹配（包含匹配）")
+    delete_parser.add_argument("--older-than", type=int, help="删除 N 天前创建的任务")
+    delete_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    delete_parser.add_argument("--limit", "-n", type=int, default=50, help="限制处理数量（默认 50）")
+    delete_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
+    
     # cookie 命令
     cookie_parser = subparsers.add_parser("cookie", help="设置浏览器 cookie（用于访问内部 API）")
     cookie_parser.add_argument("cookie", nargs="?", help="浏览器 cookie 字符串")
@@ -2912,6 +3093,8 @@ def main():
         "remove": cmd_remove,
         "rm": cmd_remove,
         "clear": cmd_clear,
+        "delete": cmd_delete,
+        "del": cmd_delete,
         "cookie": cmd_cookie,
         "login": cmd_login,
         "workspace": cmd_workspace,
